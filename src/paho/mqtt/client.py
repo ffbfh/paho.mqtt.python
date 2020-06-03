@@ -638,6 +638,7 @@ class Client(object):
         # No default callbacks
         self._on_log = None
         self._on_connect = None
+        self._on_auth = None
         self._on_subscribe = None
         self._on_message = None
         self._on_publish = None
@@ -1018,6 +1019,19 @@ class Client(object):
         self._connect_properties = properties
         self._state = mqtt_cs_connect_async
         
+
+    def auth(self, reasoncode=None, properties=None):
+        """ doing the authentication exchange with the remote broker.
+        reasoncode: (MQTT v5.0 only) a ReasonCodes instance setting the MQTT v5.0
+        reasoncode to be sent with the authentication exchange.
+        properties: (MQTT v5.0 only) a Properties instance setting the MQTT v5.0 properties
+        to be included.
+        """
+        if self._sock is None:
+            return MQTT_ERR_NO_CONN
+
+        return self._send_auth_exchange(reasoncode, properties)
+
 
     def reconnect_delay_set(self, min_delay=1, max_delay=120):
         """ Configure the exponential reconnect delay
@@ -1908,6 +1922,28 @@ class Client(object):
             self._on_connect = func
 
     @property
+    def on_auth(self):
+        """If implemented, called when the broker responds with an
+        authentication exchange request."""
+        return self._on_auth
+
+    @on_auth.setter
+    def on_auth(self, func):
+        """ Define the auth callback implementation.
+
+        Expected signature for MQTT v5.0 is:
+            auth_callback(client, reasonCode, properties)
+
+        client:     the client instance for this callback
+        reasonCode: the MQTT v5.0 reason code: an instance of the ReasonCode class.
+                    ReasonCode may be compared to interger.
+        properties: the MQTT v5.0 properties returned from the broker.  An instance
+                    of the Properties class.
+        """
+        with self._callback_mutex:
+            self._on_auth = func
+
+    @property
     def on_subscribe(self):
         """If implemented, called when the broker responds to a subscribe
         request."""
@@ -2705,6 +2741,25 @@ class Client(object):
             )
         return self._packet_queue(command, packet, 0, 0)
 
+    def _send_auth_exchange(self, reasoncode=None, properties=None):
+        command = AUTH
+        packet = bytearray()
+        packet.append(command)
+
+        packed_auth_properties = properties.pack()
+        remaining_length = 1 + len(packed_auth_properties)
+
+        self._pack_remaining_length(packet, remaining_length)
+
+        packet += reasoncode.pack()
+        packet += packed_auth_properties
+
+        self._easy_log(MQTT_LOG_DEBUG, "Sending AUTH reasonCode=%s properties=%s",
+            reasoncode,
+            properties
+            )
+        return self._packet_queue(command, packet, 0, 0)
+
     def _send_disconnect(self, reasoncode=None, properties=None):
         if self._protocol == MQTTv5:
             self._easy_log(MQTT_LOG_DEBUG, "Sending DISCONNECT reasonCode=%s properties=%s",
@@ -2962,6 +3017,8 @@ class Client(object):
             return self._handle_unsuback()
         elif cmd == DISCONNECT and self._protocol == MQTTv5:  # only allowed in MQTT 5.0
             return self._handle_disconnect()
+        elif cmd == AUTH and self._protocol == MQTTv5:  # only allowed in MQTT 5.0
+            return self._handle_auth()
         else:
             # If we don't recognise the command, return an error straight away.
             self._easy_log(MQTT_LOG_ERR, "Error: Unrecognised command %s", cmd)
@@ -2982,6 +3039,35 @@ class Client(object):
         self._ping_t = 0
         self._easy_log(MQTT_LOG_DEBUG, "Received PINGRESP")
         return MQTT_ERR_SUCCESS
+
+    def _handle_auth(self):
+        if self._in_packet['remaining_length'] < 2:
+            return MQTT_ERR_PROTOCOL
+
+        packet_type = AUTH >> 4
+        reasonCode = ReasonCodes(packet_type)
+        reasonCode.unpack(self._in_packet['packet'])
+        if self._in_packet['remaining_length'] > 3:
+            properties = Properties(packet_type)
+            props, props_len = properties.unpack(
+                self._in_packet['packet'][1:])
+
+        self._easy_log(MQTT_LOG_DEBUG, "Received AUTH %s %s",
+                       reasonCode,
+                       properties
+                       )
+
+        with self._callback_mutex:
+            if self.on_auth:
+                with self._in_callback_mutex:  # Don't call loop_write after _send_auth()
+                    try:
+                        self.on_auth(self, reasonCode, properties)
+                    except Exception as err:
+                        self._easy_log(
+                            MQTT_LOG_ERR, 'Caught exception in on_auth: %s', err)
+
+        return MQTT_ERR_SUCCESS
+
 
     def _handle_connack(self):
         if self._protocol == MQTTv5:
